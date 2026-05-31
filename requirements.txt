@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+scikit-learn
+numpy
+joblib
+pydantic>=2
+httpx
