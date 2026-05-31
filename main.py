@@ -5,6 +5,10 @@ from sklearn.preprocessing import MinMaxScaler
 import numpy as np
 import joblib
 import os
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 LABELS_DIR = os.path.join(os.path.dirname(__file__), "labels")
@@ -20,10 +24,9 @@ MODEL_FILES = {
 }
 
 # MinMaxScaler parameters fitted on all 175 341 rows of UNSW-NB15.
-# Feature order matches the 14 binary features exactly:
-#   rate, sttl, sload, dload, ct_srv_src, ct_state_ttl, ct_dst_ltm,
-#   ct_src_dport_ltm, ct_dst_sport_ltm, ct_dst_src_ltm, ct_src_ltm,
-#   ct_srv_dst, state_CON, state_INT
+# Feature order: rate, sttl, sload, dload, ct_srv_src, ct_state_ttl, ct_dst_ltm,
+#                ct_src_dport_ltm, ct_dst_sport_ltm, ct_dst_src_ltm, ct_src_ltm,
+#                ct_srv_dst, state_CON, state_INT
 _DATA_MIN = np.array(
     [0., 0., 0., 0., 1., 0., 1., 1., 1., 1., 1., 1., 0., 0.],
     dtype=np.float64,
@@ -47,22 +50,41 @@ def _build_scaler() -> MinMaxScaler:
     return s
 
 
-state: dict = {"models": {}, "scaler": None, "le1_classes": None}
+state: dict = {"models": {}, "load_errors": {}, "scaler": None, "le1_classes": None}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Building scaler...")
     state["scaler"] = _build_scaler()
+    logger.info("Scaler ready.")
 
     le1_path = os.path.join(LABELS_DIR, "le1_classes.npy")
     if os.path.exists(le1_path):
         state["le1_classes"] = np.load(le1_path, allow_pickle=True)
+        logger.info("Label classes loaded: %s", list(state["le1_classes"]))
+    else:
+        logger.warning("le1_classes.npy not found at %s", le1_path)
 
     for name, filename in MODEL_FILES.items():
         path = os.path.join(MODELS_DIR, filename)
-        if os.path.exists(path):
+        if not os.path.exists(path):
+            logger.warning("Model file not found: %s", path)
+            state["load_errors"][name] = "file not found"
+            continue
+        try:
+            logger.info("Loading %s ...", name)
             state["models"][name] = joblib.load(path)
+            logger.info("Loaded %s OK", name)
+        except Exception as exc:
+            logger.error("Failed to load %s: %s", name, exc)
+            state["load_errors"][name] = str(exc)
 
+    logger.info(
+        "Startup complete. models_loaded=%d errors=%d",
+        len(state["models"]),
+        len(state["load_errors"]),
+    )
     yield
 
 
@@ -95,6 +117,7 @@ def health():
     return {
         "status": "ok",
         "models_loaded": len(state["models"]),
+        "models_failed": state["load_errors"],
         "scaler_ready": state["scaler"] is not None,
     }
 
@@ -106,7 +129,10 @@ def predict(request: PredictRequest):
     le1_classes = state["le1_classes"]
 
     if not models:
-        raise HTTPException(status_code=503, detail="Models not loaded")
+        raise HTTPException(
+            status_code=503,
+            detail=f"No models loaded. Errors: {state['load_errors']}",
+        )
     if scaler is None:
         raise HTTPException(status_code=503, detail="Scaler not ready")
 
@@ -140,8 +166,8 @@ def predict(request: PredictRequest):
             try:
                 raw = model.predict(row)[0]
                 votes[name] = decode_label(raw)
-            except Exception:
-                votes[name] = "error"
+            except Exception as exc:
+                votes[name] = f"error: {exc}"
 
         rf_label = votes.get("random_forest", "unknown")
         rf_confidence = 0.5
