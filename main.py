@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from sklearn.preprocessing import MinMaxScaler
 import numpy as np
 import joblib
+import gc
 import os
 import logging
 
@@ -13,14 +14,15 @@ logger = logging.getLogger(__name__)
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 LABELS_DIR = os.path.join(os.path.dirname(__file__), "labels")
 
+# RF first (primary model), KNN last (largest memory footprint)
 MODEL_FILES = {
     "random_forest": "random_forest_binary.pkl",
     "decision_tree": "decision_tree_binary.pkl",
-    "knn": "knn_binary.pkl",
     "logistic_regression": "logistic_regressor_binary.pkl",
-    "svm": "lsvm_binary.pkl",
-    "mlp": "mlp_binary.pkl",
     "linear_regression": "linear_regressor_binary.pkl",
+    "mlp": "mlp_binary.pkl",
+    "svm": "lsvm_binary.pkl",
+    "knn": "knn_binary.pkl",
 }
 
 # MinMaxScaler parameters fitted on all 175 341 rows of UNSW-NB15.
@@ -79,6 +81,8 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.error("Failed to load %s: %s", name, exc)
             state["load_errors"][name] = str(exc)
+        finally:
+            gc.collect()
 
     logger.info(
         "Startup complete. models_loaded=%d errors=%d",
@@ -151,11 +155,12 @@ def predict(request: PredictRequest):
     X_scaled = scaler.transform(X)
 
     def decode_label(pred) -> str:  # type: ignore[no-untyped-def]
+        # UNSW-NB15 binary label: 0 = normal, 1 = attack/abnormal
         if le1_classes is not None:
             idx = int(round(float(pred))) if isinstance(pred, (float, np.floating)) else int(pred)
             if 0 <= idx < len(le1_classes):
                 return str(le1_classes[idx])
-        return "abnormal" if int(round(float(pred))) == 0 else "normal"
+        return "normal" if int(round(float(pred))) == 0 else "abnormal"
 
     results = []
     for i in range(len(request.flows)):
